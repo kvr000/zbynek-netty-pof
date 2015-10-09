@@ -17,9 +17,11 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.Map;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 
 
 /**
@@ -34,15 +36,24 @@ public abstract class PersistentDatagramDistributionHandler extends ChannelHandl
 	}
 
 	@Override
+	public void			bind(ChannelHandlerContext ctx, SocketAddress bind, ChannelPromise channelPromise) throws Exception
+	{
+		super.bind(ctx, bind, channelPromise);
+		if (parentChannel != null)
+			throw new IllegalStateException("PersistentDatagramDistributionHandler cannot be shared among channels, already bound.");
+		parentChannel = ctx.channel();
+	}
+
+	@Override
 	public void			channelRead(ChannelHandlerContext ctx, Object msg)
 	{
 		Channel childChannel;
 		byte[] bytes;
 		try {
 			DatagramPacket packet = (DatagramPacket) msg;
-			childChannel = getChildChannel(ctx.channel(), packet.sender());
+			childChannel = getChildChannel(packet.sender());
 			workersGroup.register(childChannel);
-			ByteBuf content = Unpooled.copiedBuffer(packet.content());
+			ByteBuf content = packet.content();
 			bytes = new byte[content.readableBytes()];
 			content.readBytes(bytes);
 		}
@@ -52,16 +63,12 @@ public abstract class PersistentDatagramDistributionHandler extends ChannelHandl
 		childChannel.pipeline().fireChannelRead(bytes);
 	}
 
-	public Channel			getChildChannel(Channel parentChannel, InetSocketAddress peerAddress)
+	protected Channel		getChildChannel(InetSocketAddress peerAddress)
 	{
-		return childChannels.computeIfAbsent(peerAddress, (InetSocketAddress peerAddress2) -> {
-			PersistentDatagramChannel channel = new PersistentDatagramChannel(parentChannel, peerAddress);
-			initChildChannel(channel);
-			return channel;
-		});
+		return childChannels.computeIfAbsent(peerAddress, childChannelComputer);
 	}
 
-	public abstract Channel		initChildChannel(Channel childChannel);
+	protected abstract Channel	initChildChannel(Channel childChannel);
 
 	@Override
 	public void			exceptionCaught(ChannelHandlerContext ctx, Throwable cause)
@@ -71,9 +78,17 @@ public abstract class PersistentDatagramDistributionHandler extends ChannelHandl
 		ctx.close();
 	}
 
+	protected Channel		parentChannel;
+
 	protected EventLoopGroup	workersGroup;
 
 	protected Logger		logger = LogManager.getLogger();
+
+	protected Function<? super InetSocketAddress, ? extends Channel> childChannelComputer =  (InetSocketAddress peerAddress) -> {
+		PersistentDatagramChannel channel = new PersistentDatagramChannel(parentChannel, peerAddress);
+		initChildChannel(channel);
+		return channel;
+	};
 
 	protected Map<InetSocketAddress, Channel> childChannels =
 		CacheBuilder.<InetSocketAddress, Channel>newBuilder()
